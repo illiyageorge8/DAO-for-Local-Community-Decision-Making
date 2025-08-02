@@ -8,7 +8,10 @@
 (define-constant ERR-DELEGATE-NOT-RESIDENT (err u107))
 (define-constant ERR-QUORUM-NOT-MET (err u108))
 (define-constant ERR-INVALID-CATEGORY (err u109))
+(define-constant ERR-TIMELOCK-ACTIVE (err u110))
+(define-constant ERR-TIMELOCK-NOT-EXPIRED (err u111))
 (define-constant VOTING_PERIOD u1440)
+(define-constant TIMELOCK_PERIOD u720)
 
 (define-constant CATEGORY-BUDGET u1)
 (define-constant CATEGORY-INFRASTRUCTURE u2)
@@ -34,7 +37,8 @@
         no-votes: uint,
         executed: bool,
         amount: uint,
-        category: uint
+        category: uint,
+        timelock-end: (optional uint)
     }
 )
 
@@ -118,7 +122,8 @@
                 no-votes: u0,
                 executed: false,
                 amount: amount,
-                category: category
+                category: category,
+                timelock-end: none
             }
         )
         (var-set proposal-count (+ proposal-id u1))
@@ -150,17 +155,32 @@
     )
 )
 
-(define-public (execute-proposal (proposal-id uint))
+(define-public (queue-proposal (proposal-id uint))
     (let (
         (proposal (unwrap! (map-get? Proposals proposal-id) ERR-NO-PROPOSAL))
         (total-votes (+ (get yes-votes proposal) (get no-votes proposal)))
         (required-quorum (get-required-quorum (get category proposal)))
         (participation-rate (/ (* total-votes u100) (var-get total-residents)))
+        (timelock-end-block (+ burn-block-height TIMELOCK_PERIOD))
     )
         (asserts! (>= (- burn-block-height (get start-block proposal)) VOTING_PERIOD) ERR-PROPOSAL-ACTIVE)
         (asserts! (not (get executed proposal)) ERR-PROPOSAL-EXISTS)
+        (asserts! (is-none (get timelock-end proposal)) ERR-TIMELOCK-ACTIVE)
         (asserts! (> (get yes-votes proposal) (get no-votes proposal)) ERR-NOT-AUTHORIZED)
         (asserts! (>= participation-rate required-quorum) ERR-QUORUM-NOT-MET)
+        
+        (map-set Proposals proposal-id (merge proposal {timelock-end: (some timelock-end-block)}))
+        (ok timelock-end-block)
+    )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+    (let (
+        (proposal (unwrap! (map-get? Proposals proposal-id) ERR-NO-PROPOSAL))
+        (timelock-end (unwrap! (get timelock-end proposal) ERR-TIMELOCK-ACTIVE))
+    )
+        (asserts! (not (get executed proposal)) ERR-PROPOSAL-EXISTS)
+        (asserts! (>= burn-block-height timelock-end) ERR-TIMELOCK-NOT-EXPIRED)
         
         (map-set Proposals proposal-id (merge proposal {executed: true}))
         (ok true)
@@ -207,6 +227,23 @@
 
 (define-read-only (get-category-quorum (category uint))
     (map-get? CategoryQuorums category)
+)
+
+(define-read-only (get-timelock-status (proposal-id uint))
+    (match (map-get? Proposals proposal-id)
+        proposal (let (
+            (timelock-end (get timelock-end proposal))
+        )
+            (if (is-some timelock-end)
+                (if (>= burn-block-height (unwrap-panic timelock-end))
+                    (some "ready")
+                    (some "locked")
+                )
+                (some "not-queued")
+            )
+        )
+        none
+    )
 )
 
 (initialize-quorums)
