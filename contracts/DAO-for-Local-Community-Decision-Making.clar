@@ -10,8 +10,13 @@
 (define-constant ERR-INVALID-CATEGORY (err u109))
 (define-constant ERR-TIMELOCK-ACTIVE (err u110))
 (define-constant ERR-TIMELOCK-NOT-EXPIRED (err u111))
+(define-constant ERR-AMENDMENT-LIMIT-REACHED (err u112))
+(define-constant ERR-NO-AMENDMENTS-ALLOWED (err u113))
+(define-constant ERR-AMENDMENT-TOO-LATE (err u114))
 (define-constant VOTING_PERIOD u1440)
 (define-constant TIMELOCK_PERIOD u720)
+(define-constant MAX-AMENDMENTS u3)
+(define-constant AMENDMENT-WINDOW u1152)
 
 (define-constant CATEGORY-BUDGET u1)
 (define-constant CATEGORY-INFRASTRUCTURE u2)
@@ -38,7 +43,9 @@
         executed: bool,
         amount: uint,
         category: uint,
-        timelock-end: (optional uint)
+        timelock-end: (optional uint),
+        amendment-count: uint,
+        last-amendment-block: (optional uint)
     }
 )
 
@@ -55,6 +62,16 @@
 (define-map CategoryQuorums
     uint
     uint
+)
+
+(define-map Amendments
+    {proposal-id: uint, amendment-index: uint}
+    {
+        title: (string-ascii 100),
+        description: (string-ascii 500),
+        amount: uint,
+        amendment-block: uint
+    }
 )
 
 (define-private (initialize-quorums)
@@ -123,11 +140,55 @@
                 executed: false,
                 amount: amount,
                 category: category,
-                timelock-end: none
+                timelock-end: none,
+                amendment-count: u0,
+                last-amendment-block: none
             }
         )
         (var-set proposal-count (+ proposal-id u1))
         (ok proposal-id)
+    )
+)
+
+(define-public (amend-proposal (proposal-id uint) (new-title (string-ascii 100)) (new-description (string-ascii 500)) (new-amount uint))
+    (let (
+        (proposal (unwrap! (map-get? Proposals proposal-id) ERR-NO-PROPOSAL))
+        (amendment-count (get amendment-count proposal))
+        (blocks-since-start (- burn-block-height (get start-block proposal)))
+        (blocks-since-last-amendment (match (get last-amendment-block proposal)
+            last-block (- burn-block-height last-block)
+            u0
+        ))
+    )
+        (asserts! (is-eq tx-sender (get proposer proposal)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get executed proposal)) ERR-PROPOSAL-EXISTS)
+        (asserts! (is-none (get timelock-end proposal)) ERR-TIMELOCK-ACTIVE)
+        (asserts! (< blocks-since-start AMENDMENT-WINDOW) ERR-AMENDMENT-TOO-LATE)
+        (asserts! (< amendment-count MAX-AMENDMENTS) ERR-AMENDMENT-LIMIT-REACHED)
+        (asserts! (< blocks-since-start VOTING_PERIOD) ERR-PROPOSAL-EXPIRED)
+        
+        (map-set Amendments {proposal-id: proposal-id, amendment-index: amendment-count}
+            {
+                title: new-title,
+                description: new-description,
+                amount: new-amount,
+                amendment-block: burn-block-height
+            }
+        )
+        
+        (map-set Proposals proposal-id
+            (merge proposal {
+                title: new-title,
+                description: new-description,
+                amount: new-amount,
+                amendment-count: (+ amendment-count u1),
+                last-amendment-block: (some burn-block-height),
+                yes-votes: u0,
+                no-votes: u0
+            })
+        )
+        
+        (ok amendment-count)
     )
 )
 
@@ -227,6 +288,35 @@
 
 (define-read-only (get-category-quorum (category uint))
     (map-get? CategoryQuorums category)
+)
+
+(define-read-only (get-amendment (proposal-id uint) (amendment-index uint))
+    (map-get? Amendments {proposal-id: proposal-id, amendment-index: amendment-index})
+)
+
+(define-read-only (get-amendment-count (proposal-id uint))
+    (match (map-get? Proposals proposal-id)
+        proposal (some (get amendment-count proposal))
+        none
+    )
+)
+
+(define-read-only (can-amend-proposal (proposal-id uint))
+    (match (map-get? Proposals proposal-id)
+        proposal (let (
+            (blocks-since-start (- burn-block-height (get start-block proposal)))
+            (amendment-count (get amendment-count proposal))
+        )
+            (and 
+                (not (get executed proposal))
+                (is-none (get timelock-end proposal))
+                (< blocks-since-start AMENDMENT-WINDOW)
+                (< amendment-count MAX-AMENDMENTS)
+                (< blocks-since-start VOTING_PERIOD)
+            )
+        )
+        false
+    )
 )
 
 (define-read-only (get-timelock-status (proposal-id uint))
