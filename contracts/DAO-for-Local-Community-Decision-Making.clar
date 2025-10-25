@@ -13,6 +13,9 @@
 (define-constant ERR-AMENDMENT-LIMIT-REACHED (err u112))
 (define-constant ERR-NO-AMENDMENTS-ALLOWED (err u113))
 (define-constant ERR-AMENDMENT-TOO-LATE (err u114))
+(define-constant ERR-PROPOSAL-CANCELLED (err u115))
+(define-constant ERR-NOT-COUNCIL-MEMBER (err u116))
+(define-constant ERR-CANNOT-CANCEL-EXECUTED (err u117))
 (define-constant VOTING_PERIOD u1440)
 (define-constant TIMELOCK_PERIOD u720)
 (define-constant MAX-AMENDMENTS u3)
@@ -25,10 +28,11 @@
 
 (define-data-var proposal-count uint u0)
 (define-data-var total-residents uint u0)
+(define-data-var emergency-council-threshold uint u3)
 
 (define-map Residents 
     principal 
-    {verified: bool, voting-power: uint}
+    {verified: bool, voting-power: uint, is-council-member: bool}
 )
 
 (define-map Proposals
@@ -45,7 +49,9 @@
         category: uint,
         timelock-end: (optional uint),
         amendment-count: uint,
-        last-amendment-block: (optional uint)
+        last-amendment-block: (optional uint),
+        cancelled: bool,
+        cancellation-reason: (optional (string-ascii 200))
     }
 )
 
@@ -74,6 +80,11 @@
     }
 )
 
+(define-map CancellationVotes
+    {proposal-id: uint, council-member: principal}
+    bool
+)
+
 (define-private (initialize-quorums)
     (begin
         (map-set CategoryQuorums CATEGORY-BUDGET u60)
@@ -85,8 +96,18 @@
 
 (define-public (register-resident)
     (begin
-        (map-set Residents tx-sender {verified: true, voting-power: u1})
+        (map-set Residents tx-sender {verified: true, voting-power: u1, is-council-member: false})
         (var-set total-residents (+ (var-get total-residents) u1))
+        (ok true)
+    )
+)
+
+(define-public (set-council-member (member principal) (status bool))
+    (let (
+        (resident-data (unwrap! (map-get? Residents member) ERR-NOT-AUTHORIZED))
+    )
+        (asserts! (is-some (map-get? Residents tx-sender)) ERR-NOT-AUTHORIZED)
+        (map-set Residents member (merge resident-data {is-council-member: status}))
         (ok true)
     )
 )
@@ -142,7 +163,9 @@
                 category: category,
                 timelock-end: none,
                 amendment-count: u0,
-                last-amendment-block: none
+                last-amendment-block: none,
+                cancelled: false,
+                cancellation-reason: none
             }
         )
         (var-set proposal-count (+ proposal-id u1))
@@ -199,6 +222,7 @@
         (effective-voter tx-sender)
         (total-power (get-total-voting-power effective-voter))
     )
+        (asserts! (not (get cancelled proposal)) ERR-PROPOSAL-CANCELLED)
         (asserts! (< (- burn-block-height (get start-block proposal)) VOTING_PERIOD) ERR-PROPOSAL-EXPIRED)
         (asserts! (is-none (map-get? Votes {proposal-id: proposal-id, voter: effective-voter})) ERR-ALREADY-VOTED)
         
@@ -224,6 +248,7 @@
         (participation-rate (/ (* total-votes u100) (var-get total-residents)))
         (timelock-end-block (+ burn-block-height TIMELOCK_PERIOD))
     )
+        (asserts! (not (get cancelled proposal)) ERR-PROPOSAL-CANCELLED)
         (asserts! (>= (- burn-block-height (get start-block proposal)) VOTING_PERIOD) ERR-PROPOSAL-ACTIVE)
         (asserts! (not (get executed proposal)) ERR-PROPOSAL-EXISTS)
         (asserts! (is-none (get timelock-end proposal)) ERR-TIMELOCK-ACTIVE)
@@ -240,11 +265,69 @@
         (proposal (unwrap! (map-get? Proposals proposal-id) ERR-NO-PROPOSAL))
         (timelock-end (unwrap! (get timelock-end proposal) ERR-TIMELOCK-ACTIVE))
     )
+        (asserts! (not (get cancelled proposal)) ERR-PROPOSAL-CANCELLED)
         (asserts! (not (get executed proposal)) ERR-PROPOSAL-EXISTS)
         (asserts! (>= burn-block-height timelock-end) ERR-TIMELOCK-NOT-EXPIRED)
         
         (map-set Proposals proposal-id (merge proposal {executed: true}))
         (ok true)
+    )
+)
+
+(define-public (cancel-proposal-by-proposer (proposal-id uint) (reason (string-ascii 200)))
+    (let (
+        (proposal (unwrap! (map-get? Proposals proposal-id) ERR-NO-PROPOSAL))
+    )
+        (asserts! (is-eq tx-sender (get proposer proposal)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get executed proposal)) ERR-CANNOT-CANCEL-EXECUTED)
+        (asserts! (not (get cancelled proposal)) ERR-PROPOSAL-CANCELLED)
+        
+        (map-set Proposals proposal-id (merge proposal {cancelled: true, cancellation-reason: (some reason)}))
+        (ok true)
+    )
+)
+
+(define-public (vote-cancel-proposal (proposal-id uint))
+    (let (
+        (proposal (unwrap! (map-get? Proposals proposal-id) ERR-NO-PROPOSAL))
+        (voter-info (unwrap! (map-get? Residents tx-sender) ERR-NOT-AUTHORIZED))
+    )
+        (asserts! (get is-council-member voter-info) ERR-NOT-COUNCIL-MEMBER)
+        (asserts! (not (get executed proposal)) ERR-CANNOT-CANCEL-EXECUTED)
+        (asserts! (not (get cancelled proposal)) ERR-PROPOSAL-CANCELLED)
+        (asserts! (is-none (map-get? CancellationVotes {proposal-id: proposal-id, council-member: tx-sender})) ERR-ALREADY-VOTED)
+        
+        (map-set CancellationVotes {proposal-id: proposal-id, council-member: tx-sender} true)
+        (ok true)
+    )
+)
+
+(define-public (execute-cancellation (proposal-id uint) (reason (string-ascii 200)))
+    (let (
+        (proposal (unwrap! (map-get? Proposals proposal-id) ERR-NO-PROPOSAL))
+        (cancellation-votes (get-cancellation-votes proposal-id))
+    )
+        (asserts! (not (get executed proposal)) ERR-CANNOT-CANCEL-EXECUTED)
+        (asserts! (not (get cancelled proposal)) ERR-PROPOSAL-CANCELLED)
+        (asserts! (>= cancellation-votes (var-get emergency-council-threshold)) ERR-NOT-AUTHORIZED)
+        
+        (map-set Proposals proposal-id (merge proposal {cancelled: true, cancellation-reason: (some reason)}))
+        (ok true)
+    )
+)
+
+(define-private (get-cancellation-votes (proposal-id uint))
+    (get count (fold count-cancellation-vote
+        (list tx-sender tx-sender tx-sender tx-sender tx-sender tx-sender tx-sender tx-sender tx-sender tx-sender)
+        {proposal-id: proposal-id, count: u0}
+    ))
+)
+
+(define-private (count-cancellation-vote (member principal) (context {proposal-id: uint, count: uint}))
+    (let (
+        (has-voted (is-some (map-get? CancellationVotes {proposal-id: (get proposal-id context), council-member: member})))
+    )
+        {proposal-id: (get proposal-id context), count: (if has-voted (+ (get count context) u1) (get count context))}
     )
 )
 
@@ -332,6 +415,24 @@
                 (some "not-queued")
             )
         )
+        none
+    )
+)
+
+(define-read-only (is-council-member (member principal))
+    (match (map-get? Residents member)
+        resident (some (get is-council-member resident))
+        none
+    )
+)
+
+(define-read-only (has-voted-cancellation (proposal-id uint) (council-member principal))
+    (is-some (map-get? CancellationVotes {proposal-id: proposal-id, council-member: council-member}))
+)
+
+(define-read-only (is-proposal-cancelled (proposal-id uint))
+    (match (map-get? Proposals proposal-id)
+        proposal (some (get cancelled proposal))
         none
     )
 )
