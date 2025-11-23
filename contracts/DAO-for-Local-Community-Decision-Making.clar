@@ -16,6 +16,8 @@
 (define-constant ERR-PROPOSAL-CANCELLED (err u115))
 (define-constant ERR-NOT-COUNCIL-MEMBER (err u116))
 (define-constant ERR-CANNOT-CANCEL-EXECUTED (err u117))
+(define-constant ERR-COMMENT-TOO-LONG (err u118))
+(define-constant ERR-NO-COMMENT (err u119))
 (define-constant VOTING_PERIOD u1440)
 (define-constant TIMELOCK_PERIOD u720)
 (define-constant MAX-AMENDMENTS u3)
@@ -83,6 +85,26 @@
 (define-map CancellationVotes
     {proposal-id: uint, council-member: principal}
     bool
+)
+
+(define-map ProposalComments
+    {proposal-id: uint, comment-id: uint}
+    {
+        commenter: principal,
+        content: (string-ascii 300),
+        block-height: uint,
+        upvotes: uint
+    }
+)
+
+(define-map CommentUpvotes
+    {proposal-id: uint, comment-id: uint, voter: principal}
+    bool
+)
+
+(define-map ProposalCommentCount
+    uint
+    uint
 )
 
 (define-private (initialize-quorums)
@@ -316,6 +338,47 @@
     )
 )
 
+(define-public (comment-on-proposal (proposal-id uint) (content (string-ascii 300)))
+    (let (
+        (proposal (unwrap! (map-get? Proposals proposal-id) ERR-NO-PROPOSAL))
+        (comment-count (default-to u0 (map-get? ProposalCommentCount proposal-id)))
+        (resident-info (unwrap! (map-get? Residents tx-sender) ERR-NOT-AUTHORIZED))
+    )
+        (asserts! (not (get cancelled proposal)) ERR-PROPOSAL-CANCELLED)
+        (asserts! (not (get executed proposal)) ERR-CANNOT-CANCEL-EXECUTED)
+        
+        (map-set ProposalComments {proposal-id: proposal-id, comment-id: comment-count}
+            {
+                commenter: tx-sender,
+                content: content,
+                block-height: burn-block-height,
+                upvotes: u0
+            }
+        )
+        
+        (map-set ProposalCommentCount proposal-id (+ comment-count u1))
+        (ok comment-count)
+    )
+)
+
+(define-public (upvote-comment (proposal-id uint) (comment-id uint))
+    (let (
+        (comment (unwrap! (map-get? ProposalComments {proposal-id: proposal-id, comment-id: comment-id}) ERR-NO-COMMENT))
+        (resident-info (unwrap! (map-get? Residents tx-sender) ERR-NOT-AUTHORIZED))
+        (already-upvoted (is-some (map-get? CommentUpvotes {proposal-id: proposal-id, comment-id: comment-id, voter: tx-sender})))
+    )
+        (asserts! (not already-upvoted) ERR-ALREADY-VOTED)
+        
+        (map-set CommentUpvotes {proposal-id: proposal-id, comment-id: comment-id, voter: tx-sender} true)
+        
+        (map-set ProposalComments {proposal-id: proposal-id, comment-id: comment-id}
+            (merge comment {upvotes: (+ (get upvotes comment) u1)})
+        )
+        
+        (ok true)
+    )
+)
+
 (define-private (get-cancellation-votes (proposal-id uint))
     (get count (fold count-cancellation-vote
         (list tx-sender tx-sender tx-sender tx-sender tx-sender tx-sender tx-sender tx-sender tx-sender tx-sender)
@@ -435,6 +498,18 @@
         proposal (some (get cancelled proposal))
         none
     )
+)
+
+(define-read-only (get-comment (proposal-id uint) (comment-id uint))
+    (map-get? ProposalComments {proposal-id: proposal-id, comment-id: comment-id})
+)
+
+(define-read-only (get-comment-count (proposal-id uint))
+    (map-get? ProposalCommentCount proposal-id)
+)
+
+(define-read-only (has-upvoted-comment (proposal-id uint) (comment-id uint) (voter principal))
+    (is-some (map-get? CommentUpvotes {proposal-id: proposal-id, comment-id: comment-id, voter: voter}))
 )
 
 (initialize-quorums)
